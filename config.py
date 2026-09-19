@@ -33,3 +33,8 @@ FORCE_JOIN = os.getenv("FORCE_JOIN", "true").lower() == "true"
 
 ORDER_CHECK_INTERVAL = int(os.getenv("ORDER_CHECK_INTERVAL", "300"))
 ORDER_CHECK_BATCH = int(os.getenv("ORDER_CHECK_BATCH", "15"))
+
+# ============ MASTER SYSTEM ============
+MASTER_API_URL = os.getenv("MASTER_API_URL", "").rstrip("/")
+MASTER_API_SECRET = os.getenv("MASTER_API_SECRET", "")
+TENANT_ID = int(os.getenv("TENANT_ID", "0"))

@@ -3,6 +3,7 @@ import logging
 import config
 import db
 import sosmedly
+import master_client
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, StateFilter
@@ -11,6 +12,7 @@ from aiogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton,
     ChatMemberMember, ChatMemberAdministrator, ChatMemberOwner,
 )
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
@@ -86,8 +88,21 @@ async def is_subscribed(user_id: int) -> bool:
     try:
         member = await bot.get_chat_member(config.CHANNEL_ID, user_id)
         return isinstance(member, (ChatMemberMember, ChatMemberAdministrator, ChatMemberOwner))
+    except TelegramBadRequest as e:
+        err = str(e).lower()
+        if "chat not found" in err:
+            logger.error(
+                f"❌ BOT TIDAK BISA AKSES CHANNEL. "
+                f"Pastikan bot sudah dijadikan ADMIN di channel "
+                f"dan CHANNEL_ID ({config.CHANNEL_ID}) sudah benar."
+            )
+        elif "user not found" in err:
+            logger.info(f"User {user_id} belum pernah interact dengan channel.")
+        else:
+            logger.error(f"Gagal cek subscription {user_id}: {e}")
+        return False
     except Exception as e:
-        logger.error(f"Cek subscription gagal {user_id}: {e}")
+        logger.error(f"Gagal cek subscription {user_id}: {e}")
         return False
 
 
@@ -266,7 +281,7 @@ async def cb_check_join(call: CallbackQuery):
         await call.answer("❌ Kamu belum join channel. Silakan join dulu.", show_alert=True)
 
 
-# ============ START (dengan Referral) ============
+# ============ START ============
 @dp.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
     uid = message.from_user.id
@@ -275,7 +290,6 @@ async def cmd_start(message: Message, state: FSMContext):
         await send_join_prompt(message)
         return
 
-    # Handle referral payload: /start ref_123456
     referrer_id = 0
     args = message.text.split(maxsplit=1)
     if len(args) > 1 and args[1].startswith("ref_"):
@@ -291,7 +305,6 @@ async def cmd_start(message: Message, state: FSMContext):
     if is_new:
         await db.create_user(uid, message.from_user.username or "", message.from_user.full_name, referrer_id)
         if referrer_id:
-            # Notif ke referrer
             try:
                 ref_user = await db.get_user(referrer_id)
                 if ref_user:
@@ -713,7 +726,6 @@ async def cb_topup_approve(call: CallbackQuery):
     await db.update_topup(topup_id, "approved", call.from_user.id)
     await db.add_saldo(topup["user_id"], topup["amount"])
 
-    # Cek & bayar komisi referral
     user = await db.get_user(topup["user_id"])
     komisi_msg = ""
     if user and user.get("referrer_id"):
@@ -734,7 +746,6 @@ async def cb_topup_approve(call: CallbackQuery):
             except Exception as e:
                 logger.error(f"Notif referral gagal: {e}")
 
-    # Tandai first topup
     if user and not user.get("first_topup_done"):
         await db.set_first_topup_done(user["telegram_id"])
 
@@ -868,6 +879,7 @@ async def order_confirm(message: Message, state: FSMContext):
     uid = message.from_user.id
     total = data["total_price"]
 
+    # === CEK SALDO USER INTERNAL ===
     saldo = await db.get_saldo(uid)
     if saldo < total:
         await message.answer(
@@ -882,6 +894,48 @@ async def order_confirm(message: Message, state: FSMContext):
         )
         return
 
+    # === CEK & POTONG FEE KE MASTER ===
+    deduct_resp = await master_client.deduct_fee(
+        order_value=total,
+        provider_order_id=""
+    )
+
+    if not deduct_resp.get("ok"):
+        reason = deduct_resp.get("reason", "unknown")
+        if reason == "insufficient_kredit":
+            await message.answer(
+                f"⚠️ <b>Sistem sedang maintenance.</b>\n\n"
+                f"Admin belum top-up kredit bulanan.\n"
+                f"Hubungi admin untuk info lebih lanjut.",
+                parse_mode="HTML",
+                reply_markup=back_menu()
+            )
+        elif reason == "tenant_suspended":
+            await message.answer(
+                "🚫 <b>Akun tenant disuspend.</b>\nHubungi admin.",
+                parse_mode="HTML",
+                reply_markup=back_menu()
+            )
+        elif reason == "tenant_expired":
+            await message.answer(
+                "📅 <b>Langganan tenant expired.</b>\nHubungi admin untuk perpanjang.",
+                parse_mode="HTML",
+                reply_markup=back_menu()
+            )
+        elif reason.startswith("master_unreachable"):
+            await message.answer(
+                "🔌 <b>Sistem sedang offline.</b>\nCoba beberapa saat lagi.",
+                parse_mode="HTML",
+                reply_markup=back_menu()
+            )
+        else:
+            await message.answer(
+                f"❌ Gagal memproses order: {reason}",
+                reply_markup=back_menu()
+            )
+        return
+
+    # === LANJUT KE SOSMEDLY ===
     await message.answer("⏳ Mengirim order...")
     result = await sosmedly.create_order(
         service=data["service"], link=data["link"],
@@ -892,11 +946,13 @@ async def order_confirm(message: Message, state: FSMContext):
         return
     provider_order_id = str(result.get("order", "-"))
 
+    # === POTONG SALDO USER ===
     ok = await db.deduct_saldo(uid, total)
     if not ok:
         await message.answer("❌ Saldo tidak cukup (race). Coba lagi.", reply_markup=back_menu())
         return
 
+    # === SIMPAN ORDER ===
     order_db_id = await db.create_order(
         user_id=uid, provider_order_id=provider_order_id,
         service_id=data["service"], service_name=data["service_name"],
@@ -906,12 +962,16 @@ async def order_confirm(message: Message, state: FSMContext):
     )
     await db.inc_total_orders(uid, total)
 
+    fee_info = ""
+    if deduct_resp.get("fee_charged"):
+        fee_info = f"\n💼 Fee sistem: {rupiah(deduct_resp['fee_charged'])}"
+
     await message.answer(
         f"✅ <b>Order Berhasil!</b>\n\n"
         f"🆔 Order ID: <code>{order_db_id}</code>\n"
         f"🔖 Provider ID: <code>{provider_order_id}</code>\n"
         f"📦 {data['service_name']}\n"
-        f"🔗 {data['link']}\n🔢 {data['quantity']}\n💸 {rupiah(total)}\n\n"
+        f"🔗 {data['link']}\n🔢 {data['quantity']}\n💸 {rupiah(total)}{fee_info}\n\n"
         f"Bot akan otomatis kirim notif kalau order selesai.",
         parse_mode="HTML", reply_markup=main_menu()
     )
@@ -1017,7 +1077,7 @@ async def _do_status(message: Message, order_input: str, state: FSMContext):
     )
 
 
-# ============ BACKGROUND TASK (FITUR 1 & 2) ============
+# ============ BACKGROUND TASK ============
 async def notif_order_complete(order, provider_data):
     try:
         await bot.send_message(
@@ -1036,10 +1096,8 @@ async def notif_order_complete(order, provider_data):
 
 
 async def refund_order(order):
-    """Refund saldo user untuk order gagal."""
     try:
         await db.add_saldo(order["user_id"], order["price_sell"])
-        # Kurangi total spent
         await bot.send_message(
             order["user_id"],
             f"💰 <b>Saldo Dikembalikan</b>\n\n"
@@ -1067,16 +1125,13 @@ async def process_pending_orders():
             raw_status = (resp.get("status") or "").lower()
             old_status = (o["status"] or "").lower()
 
-            # Update status di DB kalau beda
             if raw_status and raw_status != old_status:
                 await db.update_order_status(o["id"], resp.get("status"))
 
-            # Notif kalau order selesai
             if raw_status in FINISHED_OK and not o.get("notified"):
                 await notif_order_complete(o, resp)
                 await db.mark_order_notified(o["id"])
 
-            # Refund kalau gagal
             elif raw_status in FINISHED_FAIL and not o.get("refunded"):
                 await refund_order(o)
                 await db.mark_order_refunded(o["id"])
@@ -1084,11 +1139,11 @@ async def process_pending_orders():
 
         except Exception as e:
             logger.error(f"Loop order #{o['id']} error: {e}")
-        await asyncio.sleep(1.2)  # hindari rate limit
+        await asyncio.sleep(1.2)
 
 
 async def background_loop():
-    await asyncio.sleep(20)  # tunggu bot ready dulu
+    await asyncio.sleep(20)
     while True:
         try:
             await process_pending_orders()
@@ -1113,6 +1168,24 @@ async def cmd_admin(message: Message):
         s_bal = sosmedly_bal.get("balance", "?")
     except Exception:
         s_bal = "?"
+
+    # Cek kredit tenant
+    kredit_info = ""
+    try:
+        verify = await master_client.verify_tenant()
+        if verify.get("ok") and not verify.get("skip"):
+            t = verify.get("tenant", {})
+            kredit_info = (
+                f"\n\n🏢 <b>Tenant Info</b>\n"
+                f"├ ID: {t.get('id')}\n"
+                f"├ Nama: {t.get('business_name')}\n"
+                f"├ Tier: {t.get('tier')}\n"
+                f"├ Fee rate: {t.get('fee_rate')}%\n"
+                f"└ Kredit: <b>{rupiah(t.get('saldo_kredit', 0))}</b>"
+            )
+    except Exception:
+        pass
+
     await message.answer(
         f"⚙️ <b>Admin Panel</b>\n\n"
         f"👥 Users: <b>{total_users}</b>\n"
@@ -1123,7 +1196,8 @@ async def cmd_admin(message: Message):
         f"💔 Refund: <b>{refund_count}x</b> = {rupiah(refund_amount)}\n"
         f"📊 Markup: <b>{markup}%</b>\n"
         f"🎁 Referral: <b>{ref_pct}%</b>\n"
-        f"💼 Saldo Sosmedly: <b>{s_bal}</b>\n\n"
+        f"💼 Saldo Sosmedly: <b>{s_bal}</b>"
+        f"{kredit_info}\n\n"
         f"<b>Commands:</b>\n"
         f"/setmarkup [svc:&lt;id&gt;] &lt;persen&gt;\n"
         f"/resetmarkup svc:&lt;id&gt;\n"
@@ -1133,7 +1207,37 @@ async def cmd_admin(message: Message):
         f"/setqris /setqristext /setnominals\n"
         f"/broadcast &lt;pesan&gt;\n"
         f"/refresh — refresh cache\n"
-        f"/checknow — paksa cek order sekarang",
+        f"/checknow — paksa cek order sekarang\n"
+        f"/tenant — info tenant dari master",
+        parse_mode="HTML"
+    )
+
+
+@dp.message(Command("tenant"))
+async def cmd_tenant(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    verify = await master_client.verify_tenant()
+    if verify.get("skip"):
+        await message.answer("⚠️ Master system tidak dikonfigurasi di .env")
+        return
+    if not verify.get("ok"):
+        await message.answer(
+            f"❌ <b>Tenant bermasalah</b>\n\n"
+            f"Reason: <code>{verify.get('reason')}</code>\n\n"
+            f"Hubungi admin master untuk info.",
+            parse_mode="HTML"
+        )
+        return
+    t = verify.get("tenant", {})
+    await message.answer(
+        f"🏢 <b>Info Tenant</b>\n\n"
+        f"🆔 ID: <code>{t.get('id')}</code>\n"
+        f"📛 Nama: <b>{t.get('business_name')}</b>\n"
+        f"🎚️ Tier: <b>{t.get('tier')}</b>\n"
+        f"💵 Fee rate: <b>{t.get('fee_rate')}%</b>\n"
+        f"📈 Markup: <b>{t.get('markup_percent')}%</b>\n"
+        f"💰 Kredit: <b>{rupiah(t.get('saldo_kredit', 0))}</b>",
         parse_mode="HTML"
     )
 
@@ -1363,14 +1467,16 @@ async def fallback(message: Message):
 # ============ STARTUP ============
 async def main():
     await db.init_db()
-    # Jalankan background task
     asyncio.create_task(background_loop())
     print(f"🤖 {config.BRAND_NAME} Bot berjalan...")
     print(f"🔄 Auto-notif & auto-refund: tiap {config.ORDER_CHECK_INTERVAL}s")
     if config.FORCE_JOIN:
         print(f"🔒 Wajib join channel ID: {config.CHANNEL_ID}")
+    if config.MASTER_API_URL and config.TENANT_ID:
+        print(f"🔗 Master API: {config.MASTER_API_URL} | Tenant ID: {config.TENANT_ID}")
     await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
+    import asyncio
     asyncio.run(main())
