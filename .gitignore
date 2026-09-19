@@ -1,0 +1,22 @@
+# Secret & config
+.env
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+
+# Database
+*.db
+*.sqlite3
+
+# Logs
+*.log
+
+# OS & IDE
+.DS_Store
+.vscode/
+.idea/
